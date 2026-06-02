@@ -276,7 +276,7 @@ export function REPL({ provider, initialPrompt }: Props) {
       {/* Streaming text */}
       {streamingText && (
         <Box marginBottom={1}>
-          <Markdown text={streamingText} />
+          <Markdown text={streamingText} terminalWidth={stdout.columns} />
         </Box>
       )}
 
@@ -354,7 +354,7 @@ function DisplayItemView({ item, terminalWidth }: { item: DisplayItem; terminalW
     case 'assistant-text':
       return (
         <Box marginBottom={1}>
-          <Markdown text={item.text} />
+          <Markdown text={item.text} terminalWidth={terminalWidth} />
         </Box>
       )
     case 'tool-call': {

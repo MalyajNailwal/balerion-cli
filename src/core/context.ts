@@ -1,0 +1,79 @@
+import { execSync } from 'node:child_process'
+import { allTools } from '../tools/registry.js'
+import { hasRipgrep } from '../tools/GrepTool.js'
+
+const cache = new Map<string, string>()
+
+function getGitContext(cwd: string): string | null {
+  try {
+    const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd, encoding: 'utf-8', timeout: 5000 }).trim()
+    const status = execSync('git status --short', { cwd, encoding: 'utf-8', timeout: 5000 }).trim()
+    const log = execSync('git log --oneline -5', { cwd, encoding: 'utf-8', timeout: 5000 }).trim()
+    const diff = execSync('git diff --stat', { cwd, encoding: 'utf-8', timeout: 5000 }).trim()
+    let result = `Branch: ${branch}\nStatus:\n${status || '(clean)'}\nRecent commits:\n${log}`
+    if (diff) {
+      result += `\nChanged files:\n${diff}`
+    }
+    return result
+  } catch {
+    return null
+  }
+}
+
+export function buildSystemPrompt(cwd: string): string {
+  const cached = cache.get(cwd)
+  if (cached) return cached
+
+  const rgAvailable = hasRipgrep()
+
+  const parts = [
+    'You are Balerion, an interactive CLI coding agent. You help users with software engineering tasks by reading, writing, and editing code, running shell commands, and searching codebases.',
+    '',
+    'You have access to tools for interacting with the filesystem and running commands. Use them to accomplish tasks.',
+    '',
+    `Current directory: ${cwd}`,
+    `Platform: ${process.platform}`,
+    `Shell: ${process.env.SHELL || process.env.COMSPEC || 'bash'}`,
+    `Date: ${new Date().toISOString().split('T')[0]}`,
+  ]
+
+  const git = getGitContext(cwd)
+  if (git) {
+    parts.push('', `Git:\n${git}`)
+  }
+
+  const tools = allTools().filter(t => {
+    // Hide GrepTool if ripgrep is not installed
+    if (t.name === 'Grep' && !rgAvailable) return false
+    return true
+  })
+
+  if (tools.length > 0) {
+    parts.push('', 'Available tools:')
+    for (const t of tools) {
+      parts.push(`- ${t.name}: ${t.description}`)
+    }
+  }
+
+  parts.push(
+    '',
+    'Guidelines:',
+    '- Read files before editing them.',
+    '- Use Glob/Grep to find files instead of guessing paths.',
+    '- Be concise in your responses.',
+    '- When editing, provide exact string matches for old_string.',
+    '- Run tests after making changes to verify correctness.',
+  )
+
+  const result = parts.join('\n')
+  cache.set(cwd, result)
+  return result
+}
+
+export function resetContext(cwd?: string) {
+  if (cwd) {
+    cache.delete(cwd)
+  } else {
+    cache.clear()
+  }
+}

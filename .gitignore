@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.balerionrc
+.env
+*.log
+.claude/
+docs/
+.opencode/

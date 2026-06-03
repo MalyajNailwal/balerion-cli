@@ -263,6 +263,10 @@ export function REPL({ provider, initialPrompt }: Props) {
     }
   }, [])
 
+  const handlePaste = useCallback((_preview: string, _lineCount: number) => {
+    // paste handled inline in Prompt — no system message needed
+  }, [])
+
   const msgCount = messagesRef.current.length
   const showPicker = showModelPicker || showCommandDropdown
 
@@ -305,6 +309,7 @@ export function REPL({ provider, initialPrompt }: Props) {
           isLoading={false}
           history={history}
           onInputChange={handleInputChange}
+          onPaste={handlePaste}
           disabled={showPicker}
         />
       )}

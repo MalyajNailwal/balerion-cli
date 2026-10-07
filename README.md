@@ -13,6 +13,14 @@ It reads thousands of interconnected notes, edits files, runs commands, searches
 
 Free and paid models via OpenRouter. No vendor lock-in. Just a dragon in your shell.
 
+## Tool approvals
+
+Before running a shell command, changing a file, fetching a URL, or reading outside the current project, Balerion shows the proposed action. Press `y` to approve it, `n` to deny it, or `Esc` to cancel the request. Reading and searching inside the project does not require approval.
+
+## Development
+
+Run `npm ci` to install dependencies, then `npm run check` to typecheck, test, and build the TypeScript CLI.
+
 ---
 
 *"Balerion. The Black Dread. The last living creature to have known Old Valyria before the Doom."*

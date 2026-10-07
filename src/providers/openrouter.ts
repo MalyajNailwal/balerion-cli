@@ -1,5 +1,6 @@
 import { parseSSEFrames } from '../core/streaming.js'
 import { debug } from '../utils/logger.js'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { Message, StreamEvent, TokenUsage, ContentBlock, TextContent, ToolUseContent, ToolResultContent } from '../types.js'
 import type { Provider, OpenRouterTool } from './provider.js'
 
@@ -76,7 +77,7 @@ export class OpenRouterProvider implements Provider {
     this.baseUrl = baseUrl || 'https://openrouter.ai/api'
   }
 
-  async *stream(messages: Message[], model: string, tools: OpenRouterTool[]): AsyncGenerator<StreamEvent> {
+  async *stream(messages: Message[], model: string, tools: OpenRouterTool[], signal?: AbortSignal): AsyncGenerator<StreamEvent> {
     yield { type: 'request_start' }
 
     const body: Record<string, unknown> = {
@@ -93,6 +94,10 @@ export class OpenRouterProvider implements Provider {
     const maxRetries = 3
 
     while (true) {
+      if (signal?.aborted) {
+        yield { type: 'error', error: 'aborted' }
+        return
+      }
       try {
         response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
           method: 'POST',
@@ -103,13 +108,15 @@ export class OpenRouterProvider implements Provider {
             'X-Title': 'Balerion',
           },
           body: JSON.stringify(body),
+          signal,
         })
 
         if (response.status === 429 && retries < maxRetries) {
           retries++
-          const delay = Math.min(1000 * Math.pow(2, retries), 8000)
-          debug(`Rate limited, retrying in ${delay}ms (attempt ${retries})`)
-          await new Promise(r => setTimeout(r, delay))
+          const delayMs = Math.min(1000 * Math.pow(2, retries), 8000)
+          debug(`Rate limited, retrying in ${delayMs}ms (attempt ${retries})`)
+          await response.body?.cancel()
+          await delay(delayMs, undefined, { signal })
           continue
         }
 
@@ -121,11 +128,18 @@ export class OpenRouterProvider implements Provider {
 
         break
       } catch (err) {
+        if (signal?.aborted) {
+          yield { type: 'error', error: 'aborted' }
+          return
+        }
         if (retries < maxRetries) {
           retries++
-          const delay = Math.min(1000 * Math.pow(2, retries), 8000)
-          debug(`Network error, retrying in ${delay}ms`, err)
-          await new Promise(r => setTimeout(r, delay))
+          const delayMs = Math.min(1000 * Math.pow(2, retries), 8000)
+          debug(`Network error, retrying in ${delayMs}ms`, err)
+          try { await delay(delayMs, undefined, { signal }) } catch {
+            yield { type: 'error', error: 'aborted' }
+            return
+          }
           continue
         }
         yield { type: 'error', error: `Network error: ${err}` }
@@ -133,7 +147,11 @@ export class OpenRouterProvider implements Provider {
       }
     }
 
-    const reader = response.body!.getReader()
+    if (!response.body) {
+      yield { type: 'error', error: 'API returned an empty response body' }
+      return
+    }
+    const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
     let fullContent = ''
@@ -142,6 +160,18 @@ export class OpenRouterProvider implements Provider {
     // Track active tool calls
     const activeToolCalls = new Map<number, { id: string; name: string; arguments: string }>()
     let toolEndsEmitted = false
+    let finished = false
+
+    const buildMessage = (): Message => {
+      const contentBlocks: ContentBlock[] = []
+      if (fullContent) contentBlocks.push({ type: 'text', text: fullContent })
+      for (const tc of activeToolCalls.values()) {
+        let input: Record<string, unknown> = {}
+        try { input = JSON.parse(tc.arguments || '{}') } catch {}
+        contentBlocks.push({ type: 'tool_use', id: tc.id, name: tc.name, input })
+      }
+      return { role: 'assistant', content: contentBlocks.length > 0 ? contentBlocks : fullContent }
+    }
 
     try {
       while (true) {
@@ -154,35 +184,9 @@ export class OpenRouterProvider implements Provider {
 
         for (const frame of frames) {
           if (frame.data === '[DONE]') {
-            // Build final message
-            const contentBlocks: ContentBlock[] = []
-            if (fullContent) {
-              contentBlocks.push({ type: 'text', text: fullContent })
-            }
-            for (const tc of activeToolCalls.values()) {
-              try {
-                contentBlocks.push({
-                  type: 'tool_use',
-                  id: tc.id,
-                  name: tc.name,
-                  input: JSON.parse(tc.arguments || '{}'),
-                })
-              } catch {
-                contentBlocks.push({
-                  type: 'tool_use',
-                  id: tc.id,
-                  name: tc.name,
-                  input: {},
-                })
-              }
-            }
-
             yield {
               type: 'message_complete',
-              message: {
-                role: 'assistant',
-                content: contentBlocks.length > 0 ? contentBlocks : fullContent,
-              },
+              message: buildMessage(),
               usage,
             }
             return
@@ -251,6 +255,7 @@ export class OpenRouterProvider implements Provider {
 
           // Check for finish_reason to emit tool_use_end (once only)
           if (!toolEndsEmitted && (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'stop')) {
+            finished = true
             toolEndsEmitted = true
             for (const tc of activeToolCalls.values()) {
               let parsedInput: Record<string, unknown> = {}
@@ -265,6 +270,13 @@ export class OpenRouterProvider implements Provider {
           }
         }
       }
+      if (finished) {
+        yield { type: 'message_complete', message: buildMessage(), usage }
+        return
+      }
+      yield { type: 'error', error: 'API stream ended before completion' }
+    } catch (err) {
+      yield { type: 'error', error: signal?.aborted ? 'aborted' : `Stream error: ${err}` }
     } finally {
       reader.releaseLock()
     }

@@ -1,4 +1,4 @@
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
+import { writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { getModelProfile } from '../config/models.js'
@@ -63,13 +63,14 @@ const COST_FILE = join(homedir(), '.balerion', 'session-cost.json')
 
 export function saveCosts(sessionId: string) {
   const dir = dirname(COST_FILE)
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 })
   const data = {
     sessionId,
     models: Object.fromEntries(state.models),
     sessionStart: state.sessionStart,
   }
-  writeFileSync(COST_FILE, JSON.stringify(data))
+  writeFileSync(COST_FILE, JSON.stringify(data), { mode: 0o600 })
+  chmodSync(COST_FILE, 0o600)
 }
 
 export function restoreCosts(sessionId: string): boolean {

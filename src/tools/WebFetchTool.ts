@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import type { ToolDef } from './Tool.js'
 import type { ToolResult, ToolContext } from '../types.js'
+import { VERSION } from '../version.js'
 
 const inputSchema = z.object({
   url: z.string().describe('URL to fetch'),
@@ -18,18 +19,19 @@ export const WebFetchTool: ToolDef<typeof inputSchema, Output> = {
   isConcurrencySafe: true,
 
   async call(input: Input, context: ToolContext): Promise<ToolResult<Output>> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 30000)
+    const onAbort = () => controller.abort()
+    context.abortSignal?.addEventListener('abort', onAbort, { once: true })
+    if (context.abortSignal?.aborted) onAbort()
     try {
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 30000)
-
       const res = await fetch(input.url, {
         headers: {
-          'User-Agent': 'Balerion/0.4.0',
+          'User-Agent': `Balerion/${VERSION}`,
           ...(input.headers ?? {}),
         },
         signal: controller.signal,
       })
-      clearTimeout(timeout)
 
       let body = await res.text()
       if (body.length > 50000) {
@@ -41,12 +43,16 @@ export const WebFetchTool: ToolDef<typeof inputSchema, Output> = {
 
       return {
         data: { status: res.status, body, headers: responseHeaders },
+        isError: !res.ok,
       }
     } catch (err: any) {
       return {
         data: { status: 0, body: `Fetch error: ${err.message}`, headers: {} },
         isError: true,
       }
+    } finally {
+      clearTimeout(timeout)
+      context.abortSignal?.removeEventListener('abort', onAbort)
     }
   },
 

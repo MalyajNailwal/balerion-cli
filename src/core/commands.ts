@@ -84,10 +84,10 @@ const COMMANDS: SlashCommand[] = [
   },
   {
     name: 'compact',
-    description: 'Compact conversation (keep last 4 messages)',
+    description: 'Summarize older conversation',
     execute: (_args, context) => {
       context.compactMessages()
-      return 'Conversation compacted. Kept last 4 messages.'
+      return 'Older conversation condensed.'
     },
   },
   {

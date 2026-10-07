@@ -12,7 +12,7 @@ const ALL_COMMANDS: CommandDef[] = [
   { name: 'model',   aliases: ['m'], description: 'Switch model (free + paid)' },
   { name: 'clear',   aliases: ['c'], description: 'Clear conversation history' },
   { name: 'cost',    aliases: [],    description: 'Show session cost breakdown' },
-  { name: 'compact', aliases: [],    description: 'Compact conversation (keep last 4)' },
+  { name: 'compact', aliases: [],    description: 'Summarize older conversation' },
   { name: 'quit',    aliases: ['q'], description: 'Exit Balerion' },
 ]
 

@@ -102,7 +102,7 @@ const PROVIDERS: ProviderInfo[] = [
 
 async function setupFlow() {
   const { createInterface } = await import('node:readline')
-  const { writeFileSync, existsSync, readFileSync, mkdirSync } = await import('node:fs')
+  const { writeFileSync, existsSync, readFileSync, mkdirSync, chmodSync } = await import('node:fs')
   const { join } = await import('node:path')
   const { homedir } = await import('node:os')
   const { exec } = await import('node:child_process')
@@ -222,7 +222,8 @@ async function setupFlow() {
   const balerionDir = join(homedir(), '.balerion')
   if (!existsSync(balerionDir)) mkdirSync(balerionDir, { recursive: true })
 
-  writeFileSync(rcPath, JSON.stringify(existing, null, 2) + '\n')
+  writeFileSync(rcPath, JSON.stringify(existing, null, 2) + '\n', { mode: 0o600 })
+  chmodSync(rcPath, 0o600)
 
   console.log(stepDone(4, 'Saved to ~/.balerionrc'))
   console.log('')
@@ -277,7 +278,7 @@ async function logoutFlow() {
 
 async function autoSetup(): Promise<boolean> {
   const { createInterface } = await import('node:readline')
-  const { writeFileSync, existsSync, readFileSync, mkdirSync } = await import('node:fs')
+  const { writeFileSync, existsSync, readFileSync, mkdirSync, chmodSync } = await import('node:fs')
   const { join } = await import('node:path')
   const { homedir } = await import('node:os')
   const { exec } = await import('node:child_process')
@@ -364,7 +365,8 @@ async function autoSetup(): Promise<boolean> {
   const balerionDir = join(homedir(), '.balerion')
   if (!existsSync(balerionDir)) mkdirSync(balerionDir, { recursive: true })
 
-  writeFileSync(rcPath, JSON.stringify(existing, null, 2) + '\n')
+  writeFileSync(rcPath, JSON.stringify(existing, null, 2) + '\n', { mode: 0o600 })
+  chmodSync(rcPath, 0o600)
 
   console.log(stepDone(3, 'Configuration saved'))
   console.log('')
@@ -456,8 +458,10 @@ async function main(modelOverride?: string, initialPrompt?: string, resumeSessio
     modelOverride: modelOverride || null,
   }
 
-  const { saveCosts } = await import('../state/costTracker.js')
+  const { saveCosts, restoreCosts } = await import('../state/costTracker.js')
   const { getTotalCost, formatCostSummary } = await import('../state/costTracker.js')
+
+  if (resumeSession && restoredMessages.length > 0) restoreCosts(sessionId)
 
   process.on('exit', () => {
     const cost = getTotalCost()

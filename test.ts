@@ -29,6 +29,10 @@ import { estimateTokens, estimateMessagesTokens } from './src/utils/tokens.js'
 import { addUsage, getTotalCost, getTotalTokens, resetCosts, formatCostSummary, formatTokenCount } from './src/state/costTracker.js'
 import { selectModel } from './src/providers/router.js'
 import { buildSystemPrompt, resetContext } from './src/core/context.js'
+import { query } from './src/core/query.js'
+import { compactMessages } from './src/core/conversation.js'
+import { OpenRouterProvider } from './src/providers/openrouter.js'
+import type { Provider } from './src/providers/provider.js'
 import type { ToolContext, Message, RouterConfig } from './src/types.js'
 
 // ============================================================
@@ -417,7 +421,7 @@ async function testBashTool() {
 
   await test('BashTool: captures exit code', async () => {
     const result = await BashTool.call({ command: 'exit 42' }, ctx)
-    return result.data.exitCode === 42
+    return result.data.exitCode === 42 && result.isError === true
   })
 
   await test('BashTool: captures stderr', async () => {
@@ -522,25 +526,36 @@ async function testGrepTool() {
 
 async function testWebFetchTool() {
   const ctx = makeCtx()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })
+
+  try {
 
   await test('WebFetchTool: fetches a URL', async () => {
-    const result = await WebFetchTool.call({ url: 'https://httpbin.org/get' }, ctx)
+    const result = await WebFetchTool.call({ url: 'https://example.com/get' }, ctx)
     return !result.isError && result.data.status === 200
   })
 
   await test('WebFetchTool: response body is non-empty', async () => {
-    const result = await WebFetchTool.call({ url: 'https://httpbin.org/get' }, ctx)
+    const result = await WebFetchTool.call({ url: 'https://example.com/get' }, ctx)
     return result.data.body.length > 0
   })
 
   await test('WebFetchTool: captures headers', async () => {
-    const result = await WebFetchTool.call({ url: 'https://httpbin.org/get' }, ctx)
+    const result = await WebFetchTool.call({ url: 'https://example.com/get' }, ctx)
     return Object.keys(result.data.headers).length > 0
   })
 
   await test('WebFetchTool: invalid URL returns error', async () => {
+    globalThis.fetch = async () => { throw new TypeError('Invalid URL') }
     const result = await WebFetchTool.call({ url: 'http://invalid.invalid.invalid' }, ctx)
     return result.isError === true
+  })
+
+  await test('WebFetchTool: HTTP 404 is an error', async () => {
+    globalThis.fetch = async () => new Response('missing', { status: 404 })
+    const result = await WebFetchTool.call({ url: 'https://example.com/missing' }, ctx)
+    return result.isError === true && result.data.status === 404
   })
 
   await test('WebFetchTool: formatResult includes status', () => {
@@ -551,6 +566,9 @@ async function testWebFetchTool() {
   await test('WebFetchTool: activityDescription with url', () => {
     return WebFetchTool.activityDescription({ url: 'https://example.com' }).includes('example.com')
   })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 }
 
 // ============================================================
@@ -811,6 +829,152 @@ async function testContextBuilder() {
   resetContext()
 }
 
+async function testAgentFlow() {
+  await test('Compaction: keeps complete recent tool exchange', () => {
+    const messages: Message[] = [
+      { role: 'user', content: 'Original task' },
+      { role: 'assistant', content: 'Starting work' },
+      { role: 'user', content: 'Keep the earlier decision' },
+      { role: 'assistant', content: 'Decision: use the existing API' },
+      { role: 'user', content: 'Now edit the file' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: 'x.ts' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'read-1', content: 'file contents' }] },
+      { role: 'assistant', content: 'Read complete' },
+    ]
+    const compacted = compactMessages(messages, 3)
+    return compacted[0]?.content === 'Original task' &&
+      typeof compacted[1]?.content === 'string' && compacted[1].content.includes('Keep the earlier decision') &&
+      compacted[2]?.content === 'Now edit the file' &&
+      compacted.length === 6
+  })
+
+  await test('Query: preserves resumed messages in provider request', async () => {
+    const previous: Message[] = [
+      { role: 'user', content: 'Earlier request' },
+      { role: 'assistant', content: 'Earlier answer' },
+    ]
+    let seen: Message[] = []
+    const provider: Provider = {
+      async *stream(messages) {
+        seen = messages
+        yield { type: 'message_complete', message: { role: 'assistant', content: 'Done' }, usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+      },
+      async listModels() { return [] },
+    }
+    const gen = query({ messages: [...previous, { role: 'user', content: 'New request' }], model: 'openrouter/free', provider, cwd: TMP_DIR, systemPrompt: 'System', readFiles: new Set() })
+    let next = await gen.next()
+    while (!next.done) next = await gen.next()
+    return seen[1]?.content === 'Earlier request' && seen[2]?.content === 'Earlier answer' && next.value.reason === 'completed'
+  })
+
+  await test('Query: cancellation prevents tool execution', async () => {
+    const controller = new AbortController()
+    let signalPassed = false
+    const provider: Provider = {
+      async *stream(_messages, _model, _tools, signal) {
+        signalPassed = signal === controller.signal
+        yield { type: 'request_start' }
+        await new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), { once: true }))
+        yield { type: 'tool_use_end', id: 'call-1', name: 'Write', input: { file_path: tmpFile('cancelled.txt'), content: 'bad' } }
+      },
+      async listModels() { return [] },
+    }
+    const gen = query({ messages: [{ role: 'user', content: 'Write a file' }], model: 'openrouter/free', provider, cwd: TMP_DIR, systemPrompt: 'System', readFiles: new Set(), abortSignal: controller.signal })
+    await gen.next()
+    const pending = gen.next()
+    controller.abort()
+    let next = await pending
+    while (!next.done) next = await gen.next()
+    return signalPassed && next.value.reason === 'aborted' && !existsSync(tmpFile('cancelled.txt'))
+  })
+
+  await test('Query: denied write does not touch disk', async () => {
+    const deniedPath = tmpFile('denied-write.txt')
+    let approvals = 0
+    let requests = 0
+    const provider: Provider = {
+      async *stream() {
+        requests++
+        if (requests === 1) {
+          const tool = { type: 'tool_use' as const, id: 'write-1', name: 'Write', input: { file_path: deniedPath, content: 'should not exist' } }
+          yield { type: 'tool_use_end', id: tool.id, name: tool.name, input: tool.input }
+          yield { type: 'message_complete', message: { role: 'assistant', content: [tool] }, usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+        } else {
+          yield { type: 'message_complete', message: { role: 'assistant', content: 'Understood' }, usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+        }
+      },
+      async listModels() { return [] },
+    }
+    const gen = query({ messages: [{ role: 'user', content: 'Write a file' }], model: 'openrouter/free', provider, cwd: TMP_DIR, systemPrompt: 'System', readFiles: new Set(), approveTool: async () => { approvals++; return false } })
+    let next = await gen.next()
+    while (!next.done) next = await gen.next()
+    const toolResult = next.value.messages.find(m => Array.isArray(m.content) && m.content.some(b => b.type === 'tool_result'))
+    return approvals === 1 && requests === 2 && !existsSync(deniedPath) &&
+      Array.isArray(toolResult?.content) && toolResult.content[0]?.type === 'tool_result' && toolResult.content[0].is_error === true
+  })
+
+  await test('Query: reading outside workspace requires approval', async () => {
+    const workspace = join(TMP_DIR, 'approval-workspace')
+    mkdirSync(workspace, { recursive: true })
+    const outsidePath = tmpFile('private.txt')
+    await writeFile(outsidePath, 'SECRET_DO_NOT_EXPOSE')
+    let approvals = 0
+    let requests = 0
+    const provider: Provider = {
+      async *stream() {
+        requests++
+        if (requests === 1) {
+          const tool = { type: 'tool_use' as const, id: 'read-outside', name: 'Read', input: { file_path: outsidePath } }
+          yield { type: 'tool_use_end', id: tool.id, name: tool.name, input: tool.input }
+          yield { type: 'message_complete', message: { role: 'assistant', content: [tool] }, usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+        } else {
+          yield { type: 'message_complete', message: { role: 'assistant', content: 'Done' }, usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+        }
+      },
+      async listModels() { return [] },
+    }
+    const gen = query({ messages: [{ role: 'user', content: 'Read outside' }], model: 'openrouter/free', provider, cwd: workspace, systemPrompt: 'System', readFiles: new Set(), approveTool: async () => { approvals++; return false } })
+    let next = await gen.next()
+    while (!next.done) next = await gen.next()
+    const result = next.value.messages.find(m => Array.isArray(m.content) && m.content.some(b => b.type === 'tool_result'))
+    return approvals === 1 && Array.isArray(result?.content) && result.content[0]?.type === 'tool_result' &&
+      result.content[0].is_error === true && !JSON.stringify(next.value.messages).includes('SECRET_DO_NOT_EXPOSE')
+  })
+
+  await test('OpenRouter: abort signal stops active request', async () => {
+    const originalFetch = globalThis.fetch
+    const controller = new AbortController()
+    globalThis.fetch = async (_url, init) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    })
+    try {
+      const gen = new OpenRouterProvider('test').stream([], 'test-model', [], controller.signal)
+      await gen.next()
+      const pending = gen.next()
+      controller.abort()
+      const event = await pending
+      return !event.done && event.value.type === 'error' && event.value.error === 'aborted'
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  await test('OpenRouter: completes on finish reason without DONE frame', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => new Response('data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}\n\n')
+    try {
+      const events = []
+      for await (const event of new OpenRouterProvider('test').stream([], 'test-model', [])) events.push(event)
+      const completed = events.find(event => event.type === 'message_complete')
+      return completed?.type === 'message_complete' &&
+        Array.isArray(completed.message.content) && completed.message.content[0]?.type === 'text' &&
+        completed.message.content[0].text === 'hello'
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+}
+
 // ============================================================
 // 17. Slash commands
 // ============================================================
@@ -944,6 +1108,7 @@ async function runTests() {
   await testCostTracker()
   await testModelRouter()
   await testContextBuilder()
+  await testAgentFlow()
   await testCommands()
   await testEdgeCases()
 

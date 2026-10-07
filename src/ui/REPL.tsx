@@ -4,14 +4,16 @@ import { Prompt } from './Prompt.js'
 import { ModelPicker } from './ModelPicker.js'
 import { CommandDropdown } from './CommandDropdown.js'
 import { Markdown } from './Markdown.js'
+import { StatusBar } from './StatusBar.js'
 import { useAppState } from './App.js'
 import { query } from '../core/query.js'
 import { buildSystemPrompt } from '../core/context.js'
+import { compactMessages } from '../core/conversation.js'
 import { selectModel } from '../providers/router.js'
 import { isSlashCommand, executeCommand } from '../core/commands.js'
 import { saveSession } from '../state/sessions.js'
 import type { CommandContext } from '../core/commands.js'
-import type { SpinnerMode } from '../types.js'
+import type { Message, SpinnerMode, ToolUseContent } from '../types.js'
 import type { Provider } from '../providers/provider.js'
 
 type DisplayItem =
@@ -26,23 +28,28 @@ type Props = {
   initialPrompt?: string
 }
 
+type PendingApproval = { tool: ToolUseContent; resolve: (approved: boolean) => void }
+
 export function REPL({ provider, initialPrompt }: Props) {
   const { state, setState } = useAppState()
   const { exit } = useApp()
   const { stdout } = useStdout()
 
-  const [displayLog, setDisplayLog] = useState<DisplayItem[]>([])
+  const [displayLog, setDisplayLog] = useState<DisplayItem[]>(() => restoreDisplayLog(state.messages))
   const [streamingText, setStreamingText] = useState<string | null>(null)
   const [spinnerMode, setSpinnerMode] = useState<SpinnerMode>('idle')
   const [spinnerLabel, setSpinnerLabel] = useState('')
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [showCommandDropdown, setShowCommandDropdown] = useState(false)
   const [commandFilter, setCommandFilter] = useState('')
-  const [history, setHistory] = useState<string[]>([])
-  const readFilesRef = useRef(new Set<string>())
+  const [history, setHistory] = useState<string[]>(() => state.messages
+    .filter((m): m is Message & { content: string } => m.role === 'user' && typeof m.content === 'string')
+    .map(m => m.content).reverse())
+  const readFilesRef = useRef(state.readFiles)
   const abortRef = useRef<AbortController | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
-  const messagesRef = useRef<any[]>([])
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null)
+  const messagesRef = useRef<Message[]>(state.messages)
   const processedInitialPrompt = useRef(false)
   const disabledRef = useRef(false)
 
@@ -51,14 +58,18 @@ export function REPL({ provider, initialPrompt }: Props) {
   const isLoading = spinnerMode !== 'idle'
 
   useInput((ch, key) => {
+    if (pendingApproval && (ch.toLowerCase() === 'y' || ch.toLowerCase() === 'n')) {
+      pendingApproval.resolve(ch.toLowerCase() === 'y')
+      setPendingApproval(null)
+      return
+    }
     if (key.ctrl && ch === 'c') {
       if (abortRef.current) {
-        abortRef.current.abort()
-        abortRef.current = null
-        setSpinnerMode('idle')
+        pendingApproval?.resolve(false)
+        setPendingApproval(null)
+        if (!abortRef.current.signal.aborted) abortRef.current.abort()
+        setSpinnerLabel('Cancelling')
         setStreamingText(null)
-        setIsProcessing(false)
-        setDisplayLog(prev => [...prev, { type: 'system', text: 'Cancelled' }])
       } else {
         exit()
       }
@@ -67,12 +78,11 @@ export function REPL({ provider, initialPrompt }: Props) {
     // ESC key — cancel ongoing request
     if (key.escape && isLoading) {
       if (abortRef.current) {
-        abortRef.current.abort()
-        abortRef.current = null
-        setSpinnerMode('idle')
+        pendingApproval?.resolve(false)
+        setPendingApproval(null)
+        if (!abortRef.current.signal.aborted) abortRef.current.abort()
+        setSpinnerLabel('Cancelling')
         setStreamingText(null)
-        setIsProcessing(false)
-        setDisplayLog(prev => [...prev, { type: 'system', text: 'Cancelled' }])
       }
       return
     }
@@ -95,8 +105,11 @@ export function REPL({ provider, initialPrompt }: Props) {
           setState(prev => ({ ...prev, modelOverride: model, currentModel: model }))
         },
         currentModel: state.currentModel,
-        clearMessages: () => { messagesRef.current = [] },
-        compactMessages: () => { messagesRef.current = messagesRef.current.slice(-4) },
+        clearMessages: () => {
+          messagesRef.current = []
+          readFilesRef.current.clear()
+        },
+        compactMessages: () => { messagesRef.current = compactMessages(messagesRef.current, 4) },
         openModelPicker: () => { setShowModelPicker(true) },
         cwd: state.cwd,
       }
@@ -105,8 +118,11 @@ export function REPL({ provider, initialPrompt }: Props) {
 
       if (result === '__QUIT__') { exit(); return }
 
-      if (userInput.trim().startsWith('/clear') || userInput.trim().startsWith('/c ') || userInput.trim() === '/c') {
+      if (/^\/(?:clear|c)(?:\s|$)/.test(userInput.trim())) {
         setDisplayLog([])
+        try { saveSession(state.sessionId, [], state.cwd) } catch (error) {
+          setDisplayLog([{ type: 'system', text: `Could not save cleared session: ${error instanceof Error ? error.message : String(error)}` }])
+        }
       }
 
       if (result) {
@@ -143,6 +159,10 @@ export function REPL({ provider, initialPrompt }: Props) {
         maxTurns: state.config.maxTurns,
         readFiles: readFilesRef.current,
         abortSignal: abortController.signal,
+        approveTool: (tool) => new Promise<boolean>(resolve => {
+          setPendingApproval({ tool, resolve })
+          setSpinnerLabel('Waiting for approval')
+        }),
       })
 
       let result = await gen.next()
@@ -204,6 +224,9 @@ export function REPL({ provider, initialPrompt }: Props) {
 
       if (result.value) {
         messagesRef.current = result.value.messages
+        if (result.value.reason === 'max_turns') {
+          setDisplayLog(prev => [...prev, { type: 'system', text: `Stopped after ${state.config.maxTurns} model turns.` }])
+        }
       }
     } catch (err: any) {
       let errorMsg = 'Something went wrong'
@@ -224,13 +247,19 @@ export function REPL({ provider, initialPrompt }: Props) {
         setDisplayLog(prev => [...prev, { type: 'system', text: `Error: ${errorMsg}` }])
       }
     } finally {
+      setPendingApproval(null)
+      if (abortController.signal.aborted) {
+        setDisplayLog(prev => [...prev, { type: 'system', text: 'Cancelled' }])
+      }
       setSpinnerMode('idle')
       setSpinnerLabel('')
       setStreamingText(null)
       abortRef.current = null
       setIsProcessing(false)
-      if (messagesRef.current.length > 0) {
-        saveSession(state.sessionId, messagesRef.current, state.cwd)
+      try {
+        if (messagesRef.current.length > 0) saveSession(state.sessionId, messagesRef.current, state.cwd)
+      } catch (error) {
+        setDisplayLog(prev => [...prev, { type: 'system', text: `Could not save session: ${error instanceof Error ? error.message : String(error)}` }])
       }
     }
   }, [state, provider, isProcessing])
@@ -267,7 +296,6 @@ export function REPL({ provider, initialPrompt }: Props) {
     // paste handled inline in Prompt — no system message needed
   }, [])
 
-  const msgCount = messagesRef.current.length
   const showPicker = showModelPicker || showCommandDropdown
 
   return (
@@ -315,21 +343,44 @@ export function REPL({ provider, initialPrompt }: Props) {
       )}
 
       {/* Loading spinner replaces prompt — only one spinner shown */}
-      {isLoading && (
+      {isLoading && pendingApproval && (
+        <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
+          <Text bold color="yellow">Approve {pendingApproval.tool.name}?</Text>
+          <Text>{approvalDetails(pendingApproval.tool)}</Text>
+          <Text dimColor>Press y to run · n to deny · Esc to cancel</Text>
+        </Box>
+      )}
+      {isLoading && !pendingApproval && (
         <Box flexDirection="column">
           <SpinnerView mode={spinnerMode} label={spinnerLabel} />
           <Text dimColor>  Press ESC to cancel</Text>
         </Box>
       )}
 
-      {/* Inline status */}
-      <Box>
-        <Text dimColor>{state.currentModel.split('/').pop() || state.currentModel}</Text>
-        <Text dimColor> · {state.cwd.split('/').pop() || state.cwd}</Text>
-        {msgCount > 0 && <Text dimColor> · {msgCount} msgs</Text>}
-      </Box>
+      <StatusBar model={state.currentModel} cwd={state.cwd} messages={messagesRef.current} />
     </Box>
   )
+}
+
+function restoreDisplayLog(messages: Message[]): DisplayItem[] {
+  const items: DisplayItem[] = []
+  const toolNames = new Map<string, string>()
+  for (const message of messages) {
+    if (typeof message.content === 'string') {
+      if (message.role === 'user') items.push({ type: 'user', text: message.content })
+      if (message.role === 'assistant') items.push({ type: 'assistant-text', text: message.content })
+      continue
+    }
+    for (const block of message.content) {
+      if (block.type === 'text' && message.role === 'assistant') items.push({ type: 'assistant-text', text: block.text })
+      if (block.type === 'tool_use') {
+        toolNames.set(block.id, block.name)
+        items.push({ type: 'tool-call', name: block.name, summary: toolSummary(block.name, block.input) })
+      }
+      if (block.type === 'tool_result') items.push({ type: 'tool-result', name: toolNames.get(block.tool_use_id) ?? 'Tool', result: block.content, isError: block.is_error })
+    }
+  }
+  return items
 }
 
 // === Display Items ===
@@ -381,7 +432,7 @@ function DisplayItemView({ item, terminalWidth }: { item: DisplayItem; terminalW
       return (
         <Box flexDirection="column" marginLeft={1} marginBottom={1}>
           {item.isError ? (
-            <Text color="yellow">↻ {item.name} failed — model will retry</Text>
+            <Text color="yellow">✗ {item.name}: {short}</Text>
           ) : (
             <Text dimColor>{short}</Text>
           )}
@@ -462,4 +513,17 @@ function toolSummary(name: string, input: Record<string, unknown>): string {
     case 'WebFetch': return String(input.url || '')
     default: return ''
   }
+}
+
+function approvalDetails(tool: ToolUseContent): string {
+  const input = tool.input
+  if (tool.name === 'Bash') return String(input.command ?? '')
+  if (tool.name === 'Write') return `Write ${String(input.file_path ?? '')}\n${previewText(String(input.content ?? ''))}`
+  if (tool.name === 'Edit') return `Edit ${String(input.file_path ?? '')}\n- ${previewText(String(input.old_string ?? ''))}\n+ ${previewText(String(input.new_string ?? ''))}`
+  if (tool.name === 'WebFetch') return `Fetch ${String(input.url ?? '')}\nHeaders: ${JSON.stringify(input.headers ?? {})}`
+  return toolSummary(tool.name, input)
+}
+
+function previewText(value: string): string {
+  return value.length > 1200 ? `${value.slice(0, 1200)}\n... (${value.length - 1200} more characters)` : value
 }
